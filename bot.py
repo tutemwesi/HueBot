@@ -132,7 +132,7 @@ client = discord.Client(intents=intents)
 @client.event
 async def on_ready():
     print(f'{client.user} has connected to Discord!')
-    channel = client.get_channel(1087880407380410439)
+    channel = client.get_channel()
     transition_time = 0 
     colors = [{'hue': 0, 'sat': 254, 'bri': 254},   # Red
           {'hue': 25500, 'sat': 254, 'bri': 254},  # Green
