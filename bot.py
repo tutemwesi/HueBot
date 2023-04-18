@@ -139,7 +139,7 @@ async def on_ready():
           {'hue': 46920, 'sat': 254, 'bri': 254}]  # Blue
     for i in range(1):
             for color in colors:
-                # Set light color with transition time
+               
                 b.set_light('Study', {'on': True, 'transitiontime': transition_time * 10, **color})
                 time.sleep(transition_time)
     b.set_light('Study', {'on': False})      
