@@ -15,16 +15,47 @@ from datetime import datetime
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from tabulate import tabulate
+from bs4 import BeautifulSoup
 import time
 import asyncio
 import openai
 import speedtest
 import akinator
+import bbc_feeds
+import json
+from pathlib import Path
+
+import PayloadFormatter
+from DataHolder import DataHolder
+
+BOT_NAME = "HueBot"
+
+helpstring = "Hi! For a simple request, you can type something like \"!create firetruck\"\n" \
+             "More complicated requests have the following options:\n\n" \
+             "conform=1-30, describes how much the AI should conform to the prompt. Defaults to 7\n" \
+             "num=1-16, describes how many pictures to generate. Defaults to 1\n" \
+             "samples=1-100, describes how many times the ai should run over the picture. Defaults to 20\n" \
+             "res=1-1600x1-1600, describes the resolution of the image. Defaults to 512x512\n" \
+             "dn=0-1, describes the denoising amount when generating based off an existing image. Higher means more " \
+             "changes. Defaults to 0.45\n" \
+             "seed=0-very large number, describes the seed from which to begin generation. the same prompt with the " \
+             "same seed will generate the same image.\n" \
+             "\tseed is useful for making slight modifications to an image that you think is close to what you want\n" \
+             "sampler=\"Euler a\", describes the sampling method to use. there are a lot, so type sampler=help to " \
+             "get a full list\n" \
+             "{exclude this}, use curly braces to define words that you want the AI to exclude during generation\n\n" \
+             "Higher numbers for num and samples mean longer generation times.\n" \
+             "Click the die emote on my messages to reroll the same prompt with a different seed.\n" \
+             "Respond to my messages with \"!create extra words\" to include extra words in a previous prompt.\n" \
+             "Example of a complicated request (will take a couple minutes to reply. only works if a style name " \
+             "\"cartoon\" has been set; remove that parameter otherwise):\n" \
+             "!create firetruck conform=20 num=4 samples=15 res=832x256 sampler=\"DPM2 a Karras\" {birds} " \
+             "style1=\"cartoon\" "
 
 
 
 
-b = Bridge('') 
+b = Bridge('192.168.10.179') 
 lights = b.get_light_objects('id')
 lights_list = b.get_light_objects()
 locale.setlocale(locale.LC_ALL, '')
@@ -120,29 +151,190 @@ ballet = [
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-
+USERNAME = os.getenv("USER")
+PASSWORD = os.getenv("PASS")
 intents = discord.Intents.all()
-client = discord.Client(intents=intents)
+client = discord.Client(intents=intents.all())
+
+data_holder = DataHolder()
+s = requests.Session()
+
+bot = discord.Client(intents=discord.Intents.all())
 
 
 
+@client.event
+async def on_reaction_add(reaction, user):
+    if user == client.user:
+        return
+    if reaction.message.author == client.user:
+        if reaction.emoji == "🎲":
+            await reaction.message.add_reaction("🔄")
+            parent_message = await reaction.message.channel.fetch_message(reaction.message.reference.message_id)
+            await on_message(parent_message)
+            await reaction.message.remove_reaction("🔄", client.user)
+            await reaction.message.add_reaction("✅")
+
+        if reaction.emoji == "🔎":
+            await reaction.message.add_reaction("🔄")
+            data_holder.setup(reaction.message)
+            data_holder.is_upscale = True
+            await data_holder.messageattachments(reaction.message)
+            await postresponse(reaction.message)
+            await reaction.message.remove_reaction("🔄", client.user)
+            await reaction.message.add_reaction("✅")
+
+# include prompts from the parent messages in the current prompt
+async def get_all_parent_contents(message):
+    if message.content[0:5] == "!create":
+        data_holder.reply_string = " " + message.content[6:] + " " + data_holder.reply_string
+
+    # recursively get prompts from all parent messages in this reply chain
+    if message.reference is not None:
+        await get_all_parent_contents(await message.channel.fetch_message(message.reference.message_id))
+
+@client.event
+async def on_message(message):
+    # post_obj['data'][4] = 20
+    # post_obj['data'][8] = 1
+    # post_obj['data'][10] = 10
+    # post_obj['data'][16] = 512
+    # post_obj['data'][17] = 512
+
+    print(f'Message received: {message.content}')
+
+    # ignore messages from the bot
+    if message.author == client.user:
+        return
+
+    if message.content[0:5] == "!create":
+
+        # get previous prompts if this message is a response to another message
+        if message.reference is not None:
+            await get_all_parent_contents(await message.channel.fetch_message(message.reference.message_id))
+
+        await message.add_reaction("🔄")
+
+        await client.change_presence(activity=discord.Game('with myself: ' + message.content))
+
+        # set the default indices in case the previous prompt wasn't default
+        data_holder.setup(message)
+
+
+
+        # messages with attachments have different post_obj formats
+        # if the message is an upscale or img2img, format post_obj accordingly
+        is_upscale = False
+        if len(message.attachments) > 0:
+            is_upscale = await data_holder.messageattachments(message)
+        else:
+            f = open('data.json')
+            data_holder.post_obj = json.load(f)
+            f.close()
+
+        if not is_upscale:
+            await data_holder.wordparse(message)
+
+        await postresponse(message)
+
+        await message.remove_reaction("🔄", client.user)
+        await message.add_reaction("✅")
+
+        await client.change_presence(activity=None)
+
+        if len(message.content[6:].split()) > 0 and "help" in message.content[6:].split()[0]:
+            await message.channel.send(helpstring)
+
+
+# sends post_obj to the AI, gets a response,
+# pulls the seed (if it exists) and the imgdata string from the response
+# responds to the message with the new image and the seed (if it exists)
+async def postresponse(message):
+    global s
+    with open("log/post_obj.json", "w") as f:
+        f.write(json.dumps(data_holder.post_obj, indent=2))
+    response = s.post(url, json=data_holder.post_obj, timeout=300)
+    responsestr = json.dumps(response.json(), indent=2)
+    with open("log/responsejson.json", "w") as f:
+        f.write(responsestr)
+    seed = ""
+    if "Seed:" in responsestr:
+        seed = responsestr.split("Seed:", 1)[-1].split()[0][:-1]
+
+    # loops an image back into the AI
+    # if data_holder.num_loops.isnumeric() and int(data_holder.num_loops) > 1:
+    #     if int(data_holder.num_loops) > 15:
+    #         data_holder.num_loops = "15"
+    #     for x in range(0, int(data_holder.num_loops) - 1):
+    #         # if the original message doesn't have an attachment, we have to run the setup on the post_obj
+    #         if len(message.attachments) == 0:
+    #             message.attachments = [1]
+    #             convertpng2txtfile(imgdata)
+    #             data_holder.attachedjsonframework()
+    #             await data_holder.wordparse(message)
+    #         with open("attachment.txt", "r") as textfile:
+    #             data_holder.post_obj['data'][4] = "data:image/png;base64," + textfile.read()
+    #         data_holder.post_obj['data'][data_holder.prompt_ind] = data_holder.prompt_no_args
+    #         response = requests.post(url, json=data_holder.post_obj)
+    #         responsestr = json.dumps(response.json())
+    #         seed = ""
+    #         if "Seed:" in responsestr:
+    #             seed = responsestr.split("Seed:", 1)[-1].split()[0][:-1]
+    #         imgdata = base64.b64decode(response.json()['data'][0][0][22:])
+    #         filename = "testimg.png"
+    #         with open(filename, "wb") as f:
+    #             f.write(imgdata)
+
+    try:
+        if not data_holder.is_model_change:
+            picture = discord.File(os.getenv("SDLOC")+"\\"+response.json()['data'][0][0]['name'])
+    except Exception as e:
+        await message.remove_reaction("🔄", client.user)
+        await message.add_reaction("❌")
+        print(type(e))
+        return
+    if len(seed) > 0:
+        replied_message = await message.reply("seed=" + seed, file=picture)
+        await replied_message.add_reaction("🎲")
+        await replied_message.add_reaction("🔎")
+    elif not data_holder.is_model_change:
+        await message.reply(file=picture)
 
 
 
 @client.event
 async def on_ready():
+    url = "http://127.0.0.1:7860/api/predict"
+    global s
+    if json.loads(s.get("http://127.0.0.1:7860/config").content).get("detail") == "Not authenticated":
+        headers = {"Connection": "keep-alive", "Host": "127.0.0.1:7860"}
+        payload = {'username': USERNAME, 'password': PASSWORD}
+
+        res = s.post('http://127.0.0.1:7860/login', headers=headers, data=payload)
+        try:
+            if json.loads(res.content).get("detail") == "Incorrect credentials.":
+                print("Incorrect credentials. Please make sure the user and pass in .env match the user and pass given "
+                      "after --gradio-auth")
+                os._exit(1)
+        except Exception:
+            pass
+    PayloadFormatter.setup(s)
+
+    Path("log").mkdir(parents=True, exist_ok=True)
+
+
     print(f'{client.user} has connected to Discord!')
-    channel = client.get_channel()
+    channel = client.get_channel(1087880407380410439)
     transition_time = 0 
     colors = [{'hue': 0, 'sat': 254, 'bri': 254},   # Red
           {'hue': 25500, 'sat': 254, 'bri': 254},  # Green
           {'hue': 46920, 'sat': 254, 'bri': 254}]  # Blue
     for i in range(1):
             for color in colors:
-               
+                # Set light color with transition time
                 b.set_light('Study', {'on': True, 'transitiontime': transition_time * 10, **color})
                 time.sleep(transition_time)
-    b.set_light('Study', {'on': False})      
+    b.set_light('Study', {'on': True, 'hue':8402, 'sat': 140, 'bri': 64})      
     await channel.send('I am here to serve your electromagnetic radiation needs. As well as other things. Do **!help** to see what I can do')
 
 
@@ -154,9 +346,9 @@ async def on_message(message):
         return
 
     
-        
-    if  in [user.id for user in message.mentions]:
-        user = await client.fetch_user()
+        # Check if the mentioned user ID is 184368025510608896
+    if 184368025510608896 in [user.id for user in message.mentions]:
+        user = await client.fetch_user(184368025510608896)
         b.set_light('Study', 'on', True)
         b.set_light('Study', {'hue': 65535, 'sat': 254, 'bri': 255})
         b.set_light('Study', 'on', False)
@@ -171,7 +363,7 @@ async def on_message(message):
     elif client.user.mentioned_in(message):
         await message.channel.send("You called?")
 
-    if message.content.startswith('Good Bot.'):
+    if message.content.startswith('Good client.'):
         await message.channel.send('Thank you, {}'.format(message.author))
 
     if message.content.startswith('🤖'):
@@ -200,7 +392,7 @@ async def on_message(message):
         await message.channel.send('You said: ' + messagetext)     
 
     if message.content.startswith('Who are the monkeys?'):
-        await message.channel.send(' is a   🐒\n is a  🐒\n is a  🐒')
+        await message.channel.send('Eva is a   🐒\nIvy is a  🐒\nTaylor is a  🐒')
 
     if message.content.startswith('!cat'):
         await message.channel.send('https://i.imgur.com/5TrXF.gif')    
@@ -229,24 +421,31 @@ async def on_message(message):
     if message.content.startswith('!rainbow'):
         transition_time = 3
         colors = [{'hue': 0, 'sat': 254, 'bri': 254},   # Red
+          {'hue': 10922, 'sat': 254, 'bri': 254},   # Yellow
+          {'hue': 32768, 'sat': 254, 'bri': 254},       
           {'hue': 25500, 'sat': 254, 'bri': 254},  # Green
-          {'hue': 46920, 'sat': 254, 'bri': 254}]  # Blue
-        for i in range(3):
+          {'hue': 21845, 'sat': 254, 'bri': 254},
+          {'hue': 43690, 'sat': 254, 'bri': 254},
+          {'hue': 5461, 'sat': 254, 'bri': 254},
+          {'hue': 46920, 'sat': 254, 'bri': 254},  # Blue
+          {'hue': 43690, 'sat': 254, 'bri': 254}]
+        
+        for i in range(1):
             for color in colors:
                 # Set light color with transition time
                 b.set_light('Study', {'on': True, 'transitiontime': transition_time * 10, **color})
                 time.sleep(transition_time)
-        b.set_light('Study', {'on': False})        
+            b.set_light('Study', {'on': False})        
 
 
 
 
     if message.content.startswith('!light status'):
         rows = []
-        name_max_length = max(len(light.name) for light in lights_list) 
+        name_max_length = max(len(light.name) for light in lights_list) # find maximum length of light names
         for light in lights_list:
             status = '🟢' if light.on else '🔴'
-            rows.append([light.name.ljust(name_max_length), status]) 
+            rows.append([light.name.ljust(name_max_length), status]) # left-justify the name to the max length
         table = tabulate(rows, tablefmt='plain')
         await message.channel.send(f"```\n{table}\n```")
 
@@ -267,14 +466,16 @@ async def on_message(message):
         hours_since_birth = (datetime.now() - dob).total_seconds() / 3600
         seconds_since_birth = (datetime.now() - dob).total_seconds()
 
+        # Calculate the number of full moons seen and time around sun
         current_month = datetime.now().month
         current_day = datetime.now().day
         full_moons = ((datetime.now().year - dob.year) * 12 + (current_month - dob.month)) - int(current_day >= 29.5)
         days_since_birth = (datetime.now() - dob).days
-        miles_per_year = 58400000000  
+        miles_per_year = 58400000000  # approximately
         days_per_year = 365.24
-        miles_around_sun = days_since_birth * 1.6e6 / 1e9  
+        miles_around_sun = days_since_birth * 1.6e6 / 1e9  # convert to billions
 
+        # Format seconds using the locale module
         seconds_str = locale.format_string("%.0f", seconds_since_birth, grouping=True)
 
         output = (f"**{message.author}** was born on **{dob_str}**, they are **{years} years, {months} months, {weeks} weeks, {days} days, "
@@ -332,7 +533,7 @@ async def on_message(message):
             b.set_light('Study', {'on': True, 'bri': 32})
         await message.channel.send("The current Moon phase is:\n {}".format(phase_name))
 
-    if message.content.startswith('!iss'):
+    if message.content.startswith('!iss now'):
         iss_response = requests.get("http://api.open-notify.org/iss-now.json")
 
         if iss_response.status_code == 200:
@@ -340,7 +541,7 @@ async def on_message(message):
                 latitude = iss_data["iss_position"]["latitude"]
                 longitude = iss_data["iss_position"]["longitude"]
 
-                geocode_url = f"https://api.opencagedata.com/geocode/v1/json?q={latitude}+{longitude}&key="
+                geocode_url = f"https://api.opencagedata.com/geocode/v1/json?q={latitude}+{longitude}&key=155b6df5e4954191b8773b10d6fb3be0"
                 geocode_response = requests.get(geocode_url)
 
         if geocode_response.status_code == 200:
@@ -349,18 +550,48 @@ async def on_message(message):
         await message.channel.send("🛰️ The ISS  is currently above:\n{}".format(location))
 
 
+    if message.content.startswith('!iss next'):
+        url = 'https://spotthestation.nasa.gov/sightings/view.cfm?country=United_Kingdom&region=England&city=Gloucester'
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        table_div = soup.find('div', {'class': 'table-responsive'})
+
+        if table_div is not None:
+            table = table_div.find('table')  # Find the table within the div
+
+        # Use list comprehension to extract the data from each row
+            sighting_data = [
+                [
+                    columns[0].find('span', {'class': 'title'}).text.strip() if columns[0].find('span', {'class': 'title'}) else columns[0].text.strip(),
+                    columns[1].find('span', {'class': 'title'}).text.strip() if columns[1].find('span', {'class': 'title'}) else columns[1].text.strip(),
+                    columns[2].find('span', {'class': 'title'}).text.strip() if columns[2].find('span', {'class': 'title'}) else columns[2].text.strip(),
+                    columns[3].find('span', {'class': 'title'}).text.strip() if columns[3].find('span', {'class': 'title'}) else columns[3].text.strip(),
+                    columns[4].find('span', {'class': 'title'}).text.strip() if columns[4].find('span', {'class': 'title'}) else columns[4].text.strip()
+                ]
+                for row in table.findAll('tr')[1:]  # Skip the first row (header)
+                for columns in [row.findAll('td')]
+            ]
+
+            table = tabulate(sighting_data, headers=['Date', 'Visible', 'Max Height', 'Appears', 'Disappears'], tablefmt='plain')
+            await message.channel.send(f'```\n{table}\n```')
+        else:
+            await message.channel.send('Table not found. Please check the URL or website structure.')
+
+
+
     if message.content.startswith('!wiki'):
-        await message.channel.send('What shall I search the wikiwoo for?')
-        response = await client.wait_for('message', check=lambda m: m.author == message.author, timeout=10)
+        search_term = message.content[6:].strip()
 
         try:
-            page = wikipedia.page(response.content)
+            page = wikipedia.page(search_term)
 
             # Return the summary of the page
             await message.channel.send(f"Here's what I found on Wikipedia: {page.title}\n{page.url}")
-        
+
         except wikipedia.exceptions.PageError:
-            await message.channel.send(f'Sorry, I could not find a page for "{response.content}".')
+            await message.channel.send(f'Sorry, I could not find a page for "{search_term}".')
+
 
     if message.content.startswith('!light morse'):
         morse_dict = {'A': '.-', 'B': '-...', 'C': '-.-.', 'D': '-..', 'E': '.', 'F': '..-.', 'G': '--.', 'H': '....', 'I': '..', 'J': '.---', 'K': '-.-', 'L': '.-..', 'M': '--', 'N': '-.', 'O': '---', 'P': '.--.', 'Q': '--.-', 'R': '.-.', 'S': '...', 'T': '-', 'U': '..-', 'V': '...-', 'W': '.--', 'X': '-..-', 'Y': '-.--', 'Z': '--..', '0': '-----', '1': '.----', '2': '..---', '3': '...--', '4': '....-', '5': '.....', '6': '-....', '7': '--...', '8': '---..', '9': '----.', '.': '.-.-.-', ',': '--..--', '?': '..--..', "'": '.----.', '!': '-.-.--', '/': '-..-.', '(': '-.--.', ')': '-.--.-', '&': '.-...', ':': '---...', ';': '-.-.-.', '=': '-...-', '+': '.-.-.', '-': '-....-', '_': '..--.-', '"': '.-..-.', '$': '...-..-', '@': '.--.-.'}
@@ -385,7 +616,7 @@ async def on_message(message):
         await message.channel.send(morse_code)
 
     if message.content.startswith('!weather'):
-        api_key = ""
+        api_key = "a4d2e1e57eed9e0a3a5fa37f68565fbf"
         url = "https://api.openweathermap.org/data/2.5/weather"
         params = {
             "q": "Gloucester,UK",
@@ -424,7 +655,7 @@ async def on_message(message):
             await message.channel.send('Timeout. Please try again.')
 
     if message.content.startswith('!gpt'):
-        openai.api_key = ""
+        openai.api_key = "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"
         model_engine = "text-davinci-002"
         def chat(prompt):
             response = openai.Completion.create(
@@ -443,6 +674,8 @@ async def on_message(message):
         chunks = [response[i:i+1990] for i in range(0, len(response), 1990)]
         for chunk in chunks:
             await message.channel.send(f"```{chunk}```")
+
+
 
     if message.content.startswith('!speed'):
         await message.channel.send('Starting test...')
@@ -486,10 +719,10 @@ async def on_message(message):
 
             if answer.content.lower() == 'b':
                 question = akinator_game.back()
-                akinator_game.progression -= 1 
+                akinator_game.progression -= 1 # update progression value
             else:
                 question = akinator_game.answer(answer.content.lower())
-                akinator_game.progression += 1 
+                akinator_game.progression += 1 # update progression value
 
             if akinator_game.progression >= 80:
                 guess = akinator_game.win()
@@ -510,13 +743,25 @@ async def on_message(message):
             else:
                 await message.channel.send(question)
 
+    if message.content.startswith('!news'):
+        stories = bbc_feeds.news().all(limit=3)
+        for story in stories:
+            await message.channel.send(story.link)
 
+    if message.content.startswith('!tts'):
+            text = message.content[5:]
+            await message.channel.send(text, tts=True)
+            
+
+    if message.content.startswith('scary'):
+        await message.channel.send('👻')
+        await message.channel.send('BOO!', tts=True)
 
 
           
    
     if message.content.startswith('!help'):
-        embedVar = discord.Embed(title="Hello Friend. I am HueBot.", description="The following commands are currently supported:", color=0x00ff00)
+        embedVar = discord.Embed(title="Hello Friend. I am Hueclient.", description="The following commands are currently supported:", color=0x00ff00)
         embedVar.add_field(name="Turn 💡 On", value="!light on", inline=True)
         embedVar.add_field(name="Turn 💡 Off", value="!light off", inline=True)
         embedVar.add_field(name="Dim 💡", value="!light dim", inline=True)
@@ -534,6 +779,5 @@ async def on_message(message):
         embedVar.set_author(name="HueBot", url="https://tutemwesi.com", icon_url="https://i.imgur.com/MxlRE7P.png")
         embedVar.set_footer(text="It has been a pleasure serving your electromagnetic radiation needs.\nThis command was requested by: {}".format(message.author))
         await message.channel.send(embed=embedVar)
-
 
 client.run(TOKEN)
